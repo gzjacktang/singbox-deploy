@@ -216,6 +216,274 @@ select_ss_method() {
 select_ss_method
 
 # -----------------------
+# Reality 目标发现与优选
+REALITY_SCAN_CANDIDATES=(
+    "www.cloudflare.com"
+    "www.microsoft.com"
+    "www.amazon.com"
+    "aws.amazon.com"
+    "www.samsung.com"
+    "www.nvidia.com"
+    "www.amd.com"
+    "www.intel.com"
+    "www.sony.com"
+    "dl.google.com"
+    "addons.mozilla.org"
+)
+REALITY_SCAN_ATTEMPTS=3
+REALITY_SCAN_TIMEOUT=10
+REALITY_SCAN_MAX_IMPORT=50
+
+normalize_reality_host() {
+    local host="${1:-}"
+    host="$(printf '%s' "$host" | tr -d '\r' | xargs 2>/dev/null || true)"
+    host="${host#https://}"
+    host="${host#http://}"
+    host="${host%%/*}"
+    host="${host%%:*}"
+    host="${host#.}"
+    printf '%s' "$host" | tr '[:upper:]' '[:lower:]'
+}
+
+is_valid_reality_host() {
+    local host
+    host="$(normalize_reality_host "${1:-}")"
+    [[ -n "$host" && "$host" != \*.* && "$host" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ && "$host" == *.* ]]
+}
+
+reality_tls_probe_once() {
+    local host="$1"
+    local output latency_seconds latency_ms
+
+    output=$(printf '' | timeout "$REALITY_SCAN_TIMEOUT" openssl s_client \
+        -connect "${host}:443" \
+        -servername "$host" \
+        -tls1_3 \
+        -alpn h2 \
+        -groups X25519 \
+        -verify_hostname "$host" \
+        -verify_return_error 2>&1) || return 1
+
+    if ! grep -Eq 'Protocol *: TLSv1\.3|Protocol version: TLSv1\.3' <<< "$output"; then
+        return 1
+    fi
+    if ! grep -q 'ALPN protocol: h2' <<< "$output"; then
+        return 1
+    fi
+    if ! grep -Eq 'Verify return code: 0 \(ok\)|Verification: OK' <<< "$output"; then
+        return 1
+    fi
+
+    latency_seconds=$(curl -o /dev/null -sS \
+        --connect-timeout "$REALITY_SCAN_TIMEOUT" \
+        --max-time "$REALITY_SCAN_TIMEOUT" \
+        --tlsv1.3 \
+        -w '%{time_appconnect}' \
+        "https://${host}/" 2>/dev/null) || return 1
+    latency_ms=$(awk -v seconds="$latency_seconds" 'BEGIN { printf "%d", (seconds * 1000) + 0.5 }')
+    [[ "$latency_ms" =~ ^[0-9]+$ && "$latency_ms" -gt 0 ]] || return 1
+    printf '%s\n' "$latency_ms"
+}
+
+median_latency() {
+    printf '%s\n' "$@" | sort -n | awk '{ values[NR]=$1 } END { if (NR) print values[int((NR+1)/2)] }'
+}
+
+scan_reality_candidate() {
+    local host="$1"
+    local attempt latency successes=0
+    local -a latencies=()
+
+    for ((attempt=1; attempt<=REALITY_SCAN_ATTEMPTS; attempt++)); do
+        if latency=$(reality_tls_probe_once "$host"); then
+            latencies+=("$latency")
+            successes=$((successes + 1))
+        fi
+    done
+
+    if (( successes > 0 )); then
+        printf '%s|%s|%s\n' "$host" "$successes" "$(median_latency "${latencies[@]}")"
+    else
+        printf '%s|0|0\n' "$host"
+    fi
+}
+
+scan_reality_candidates() {
+    local results_file="$1"
+    shift
+    local host record
+    local -A seen=()
+    : > "$results_file"
+
+    for host in "$@"; do
+        host="$(normalize_reality_host "$host")"
+        if ! is_valid_reality_host "$host" || [[ -n "${seen[$host]:-}" ]]; then
+            continue
+        fi
+        seen[$host]=1
+        info "检测 Reality 目标: $host (共 $REALITY_SCAN_ATTEMPTS 次)" >&2
+        record="$(scan_reality_candidate "$host")"
+        printf '%s\n' "$record" >> "$results_file"
+    done
+
+    sort -t'|' -k2,2nr -k3,3n "$results_file" -o "$results_file"
+}
+
+extract_realitlscanner_candidates() {
+    local csv_file="$1"
+    awk -F',' -v limit="$REALITY_SCAN_MAX_IMPORT" '
+        function clean(v) {
+            gsub(/^\xef\xbb\xbf/, "", v)
+            gsub(/^"|"$/, "", v)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+            return tolower(v)
+        }
+        NR == 1 {
+            for (i=1; i<=NF; i++) {
+                h=clean($i)
+                if (h == "origin") origin=i
+                if (h == "cert_domain") cert=i
+            }
+            next
+        }
+        {
+            if (origin) print clean($origin)
+            if (cert) print clean($cert)
+        }
+    ' "$csv_file" | sed '/^\*\./d; /^$/d' | awk '!seen[$0]++' | head -n "$REALITY_SCAN_MAX_IMPORT"
+}
+
+show_and_pick_reality_result() {
+    local results_file="$1"
+    local line host successes latency index=0
+    local -a selectable=()
+
+    echo ""
+    printf '%-4s %-32s %-8s %-10s %s\n' "序号" "Reality 目标" "成功率" "延迟" "状态"
+    while IFS='|' read -r host successes latency; do
+        [[ -n "$host" ]] || continue
+        index=$((index + 1))
+        if (( successes >= 2 )); then
+            selectable+=("$host")
+            printf '%-4s %-32s %s/%s    %-7s %s\n' "${#selectable[@]}" "$host" "$successes" "$REALITY_SCAN_ATTEMPTS" "${latency}ms" "可用"
+        else
+            printf '%-4s %-32s %s/%s    %-7s %s\n' "-" "$host" "$successes" "$REALITY_SCAN_ATTEMPTS" "${latency:-0}ms" "淘汰"
+        fi
+    done < "$results_file"
+
+    if (( ${#selectable[@]} == 0 )); then
+        warn "没有候选目标通过至少 2/$REALITY_SCAN_ATTEMPTS 次严格检测"
+        return 1
+    fi
+
+    echo ""
+    read -r -p "请选择目标 [默认 1]: " choice
+    choice="${choice:-1}"
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#selectable[@]} )); then
+        warn "选择无效，使用排名第一的目标"
+        choice=1
+    fi
+    REALITY_SNI="${selectable[$((choice - 1))]}"
+    return 0
+}
+
+run_installed_realitlscanner() {
+    local scanner="" target output_file="$1"
+    if command -v RealiTLScanner >/dev/null 2>&1; then
+        scanner="$(command -v RealiTLScanner)"
+    elif command -v realitlscanner >/dev/null 2>&1; then
+        scanner="$(command -v realitlscanner)"
+    fi
+    if [[ -z "$scanner" ]]; then
+        warn "未找到 RealiTLScanner，可先在本地运行后使用 CSV 导入"
+        return 1
+    fi
+
+    read -r -p "请输入要交给 RealiTLScanner 的 IP、CIDR 或域名: " target
+    [[ -n "$target" ]] || return 1
+    warn "上游建议不要在云服务器进行大范围扫描，以免触发服务商风控"
+    read -r -p "确认从当前 VPS 扫描该目标？(y/N): " confirm_scan
+    [[ "$confirm_scan" =~ ^[Yy]$ ]] || return 1
+
+    "$scanner" -addr "$target" -thread 4 -timeout 5 -out "$output_file"
+    [[ -s "$output_file" ]]
+}
+
+select_reality_sni() {
+    local choice manual csv_file scanner_csv results_file
+    local -a candidates=()
+    results_file="$(mktemp /tmp/reality-scan.XXXXXX)"
+    scanner_csv="$(mktemp /tmp/realitlscanner.XXXXXX.csv)"
+
+    echo ""
+    info "=== Reality 目标站优选 ==="
+    echo "1) 快速优选常用目标（推荐）"
+    echo "2) 导入 RealiTLScanner CSV 后严格复检"
+    echo "3) 调用已安装的 RealiTLScanner，再严格复检"
+    echo "4) 严格验证手动输入的域名"
+    echo "5) 使用默认 addons.mozilla.org"
+    echo "6) 直接手动输入，不检测"
+    read -r -p "请选择 [默认 1]: " choice
+
+    case "${choice:-1}" in
+        1)
+            candidates=("${REALITY_SCAN_CANDIDATES[@]}")
+            ;;
+        2)
+            read -r -p "请输入 RealiTLScanner CSV 文件路径: " csv_file
+            if [[ ! -r "$csv_file" ]]; then
+                warn "CSV 文件不可读，改用快速优选"
+                candidates=("${REALITY_SCAN_CANDIDATES[@]}")
+            else
+                mapfile -t candidates < <(extract_realitlscanner_candidates "$csv_file")
+            fi
+            ;;
+        3)
+            if run_installed_realitlscanner "$scanner_csv"; then
+                mapfile -t candidates < <(extract_realitlscanner_candidates "$scanner_csv")
+            else
+                candidates=("${REALITY_SCAN_CANDIDATES[@]}")
+            fi
+            ;;
+        4)
+            read -r -p "请输入要验证的 Reality 域名: " manual
+            candidates=("$manual")
+            ;;
+        5)
+            REALITY_SNI="addons.mozilla.org"
+            rm -f "$results_file" "$scanner_csv"
+            return 0
+            ;;
+        6)
+            read -r -p "请输入 Reality 的 SNI: " manual
+            manual="$(normalize_reality_host "$manual")"
+            if ! is_valid_reality_host "$manual"; then
+                warn "域名格式无效，使用 addons.mozilla.org"
+                manual="addons.mozilla.org"
+            fi
+            REALITY_SNI="$manual"
+            rm -f "$results_file" "$scanner_csv"
+            return 0
+            ;;
+        *)
+            warn "选择无效，改用快速优选"
+            candidates=("${REALITY_SCAN_CANDIDATES[@]}")
+            ;;
+    esac
+
+    if (( ${#candidates[@]} == 0 )); then
+        warn "没有读取到候选域名，改用快速优选"
+        candidates=("${REALITY_SCAN_CANDIDATES[@]}")
+    fi
+    scan_reality_candidates "$results_file" "${candidates[@]}"
+    if ! show_and_pick_reality_result "$results_file"; then
+        warn "优选失败，使用 addons.mozilla.org"
+        REALITY_SNI="addons.mozilla.org"
+    fi
+    rm -f "$results_file" "$scanner_csv"
+}
+
+# -----------------------
 # 在获取公网 IP 之前，询问连接ip和sni配置
 echo ""
 echo "请输入节点连接 IP 或 DDNS域名(留空默认出口IP):"
@@ -225,10 +493,8 @@ CUSTOM_IP="$(echo "$CUSTOM_IP" | tr -d '[:space:]')"
 # 如果用户选择了 Reality 协议，询问 server_name(SNI)
 REALITY_SNI=""
 if $ENABLE_REALITY || $ENABLE_ANYTLS; then
-    echo ""
-    echo "请输入 Reality 的 SNI(留空默认 addons.mozilla.org):"
-    read -r REALITY_SNI
-    REALITY_SNI="$(echo "${REALITY_SNI:-addons.mozilla.org}" | tr -d '[:space:]')"
+    select_reality_sni
+    info "已选择 Reality SNI: $REALITY_SNI"
 else
     # 也设默认，方便后续统一处理（若未选 reality，也写入缓存以便 sb 读取）
     REALITY_SNI="addons.mozilla.org"
@@ -558,6 +824,7 @@ INBOUND_TUIC
       "listen_port": PORT_REALITY_PLACEHOLDER,
       "users": [
         {
+          "name": "default",
           "uuid": "UUID_REALITY_PLACEHOLDER",
           "flow": "xtls-rprx-vision"
         }
@@ -934,7 +1201,19 @@ echo "=========================================="
 # -----------------------
 # 创建 sb 管理脚本
 SB_PATH="/usr/local/bin/sb"
+REALITY_HELPER_PATH="/usr/local/lib/sing-box/reality-sni-tools.sh"
 info "正在创建 sb 管理面板: $SB_PATH"
+
+mkdir -p "$(dirname "$REALITY_HELPER_PATH")"
+{
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'REALITY_SCAN_CANDIDATES=("www.cloudflare.com" "www.microsoft.com" "www.amazon.com" "aws.amazon.com" "www.samsung.com" "www.nvidia.com" "www.amd.com" "www.intel.com" "www.sony.com" "dl.google.com" "addons.mozilla.org")'
+    printf '%s\n' 'REALITY_SCAN_ATTEMPTS=3' 'REALITY_SCAN_TIMEOUT=10' 'REALITY_SCAN_MAX_IMPORT=50'
+    declare -f normalize_reality_host is_valid_reality_host reality_tls_probe_once median_latency
+    declare -f scan_reality_candidate scan_reality_candidates extract_realitlscanner_candidates
+    declare -f show_and_pick_reality_result run_installed_realitlscanner select_reality_sni
+} > "$REALITY_HELPER_PATH"
+chmod 755 "$REALITY_HELPER_PATH"
 
 cat > "$SB_PATH" <<'SB_SCRIPT'
 #!/usr/bin/env bash
@@ -946,6 +1225,7 @@ err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
 CONFIG_PATH="/etc/sing-box/config.json"
 CACHE_FILE="/etc/sing-box/.config_cache"
+REALITY_HELPER_PATH="/usr/local/lib/sing-box/reality-sni-tools.sh"
 SERVICE_NAME="sing-box"
 
 # 检测系统
@@ -1049,12 +1329,10 @@ if [ "${ENABLE_REALITY:-false}" = "true" ] || [ "${ENABLE_ANYTLS:-false}" = "tru
 fi
 
 # VLESS Reality 专属参数
-if [ "${ENABLE_REALITY:-false}" = "true" ]; then
-    REALITY_PORT=$(jq -r '.inbounds[] | select(.type=="vless") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+    if [ "${ENABLE_REALITY:-false}" = "true" ]; then
+        REALITY_PORT=$(jq -r '.inbounds[] | select(.type=="vless") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
 
-    REALITY_UUID=$(jq -r '.inbounds[] | select(.type=="vless") | .users[0].uuid // empty' "$CONFIG_PATH" | head -n1)
-
-    REALITY_PK=$(jq -r '.inbounds[] | select(.type=="vless") | .tls.reality.private_key // empty' "$CONFIG_PATH" | head -n1)
+        REALITY_PK=$(jq -r '.inbounds[] | select(.type=="vless") | .tls.reality.private_key // empty' "$CONFIG_PATH" | head -n1)
 fi
 
 if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
@@ -1118,7 +1396,12 @@ generate_uris() {
     if [ "${ENABLE_REALITY:-false}" = "true" ]; then
         REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
         echo "=== VLESS Reality ===" >> "$URI_FILE"
-        echo "vless://${REALITY_UUID}@${PUBLIC_IP}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#reality${node_suffix}" >> "$URI_FILE"
+        while IFS=$'\t' read -r client_name client_uuid; do
+            [ -n "$client_uuid" ] || continue
+            client_name="${client_name:-reality}"
+            client_label=$(url_encode "${client_name}${node_suffix}")
+            echo "vless://${client_uuid}@${PUBLIC_IP}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#${client_label}" >> "$URI_FILE"
+        done < <(jq -r '.inbounds[] | select(.type=="vless") | .users[] | [(.name // "reality"), .uuid] | @tsv' "$CONFIG_PATH")
         echo "" >> "$URI_FILE"
     fi
     
@@ -1274,6 +1557,196 @@ action_reset_reality() {
     generate_uris || warn "生成 URI 失败"
 }
 
+reality_clients_enabled() {
+    read_config || return 1
+    if [ "${ENABLE_REALITY:-false}" != "true" ]; then
+        err "VLESS Reality 协议未启用"
+        return 1
+    fi
+}
+
+list_reality_clients() {
+    reality_clients_enabled || return 1
+    echo ""
+    printf '%-5s %-24s %s\n' "序号" "名称" "UUID"
+    jq -r '
+      .inbounds[] | select(.type=="vless" and .tls.reality.enabled==true)
+      | .users | to_entries[]
+      | [(.key + 1), (.value.name // ("reality-" + ((.key + 1) | tostring))), .value.uuid]
+      | @tsv
+    ' "$CONFIG_PATH" | while IFS=$'\t' read -r number name uuid; do
+        printf '%-5s %-24s %s\n' "$number" "$name" "$uuid"
+    done
+}
+
+commit_reality_clients_config() {
+    local first_uuid
+    if ! sing-box check -c "${CONFIG_PATH}.tmp" >/dev/null 2>&1; then
+        rm -f "${CONFIG_PATH}.tmp"
+        err "客户端配置校验失败，未修改当前配置"
+        return 1
+    fi
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    first_uuid=$(jq -r '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .users[0].uuid' "$CONFIG_PATH" | head -n1)
+    if grep -q '^REALITY_UUID=' "$CACHE_FILE" 2>/dev/null; then
+        sed -i "s|^REALITY_UUID=.*|REALITY_UUID=$first_uuid|" "$CACHE_FILE"
+    else
+        printf 'REALITY_UUID=%s\n' "$first_uuid" >> "$CACHE_FILE"
+    fi
+    service_restart
+    generate_uris || warn "客户端链接重新生成失败"
+}
+
+valid_client_name() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9._-]{1,32}$ ]]
+}
+
+valid_uuid() {
+    [[ "${1:-}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+add_reality_client() {
+    reality_clients_enabled || return 1
+    local name uuid
+    read -r -p "客户端名称（字母、数字、点、下划线或横线）: " name
+    if ! valid_client_name "$name"; then
+        err "名称格式无效，长度需为 1-32"
+        return 1
+    fi
+    if jq -e --arg name "$name" '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .users[] | select((.name // "") == $name)' "$CONFIG_PATH" >/dev/null; then
+        err "客户端名称已存在: $name"
+        return 1
+    fi
+    read -r -p "UUID（留空自动随机生成）: " uuid
+    uuid="${uuid:-$(rand_uuid)}"
+    if ! valid_uuid "$uuid"; then
+        err "UUID 格式无效"
+        return 1
+    fi
+    if jq -e --arg uuid "$uuid" '.inbounds[] | select(.type=="vless") | .users[] | select(.uuid == $uuid)' "$CONFIG_PATH" >/dev/null; then
+        err "UUID 已存在"
+        return 1
+    fi
+
+    jq --arg name "$name" --arg uuid "$uuid" '
+      .inbounds |= map(
+        if .type=="vless" and .tls.reality.enabled==true then
+          .users += [{"name": $name, "uuid": $uuid, "flow": "xtls-rprx-vision"}]
+        else . end
+      )
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp"
+    commit_reality_clients_config && info "已新增客户端: $name"
+}
+
+batch_add_reality_clients() {
+    reality_clients_enabled || return 1
+    local count prefix i name uuid existing
+    read -r -p "生成数量（1-20）: " count
+    if ! [[ "$count" =~ ^[0-9]+$ ]] || (( count < 1 || count > 20 )); then
+        err "数量必须在 1-20 之间"
+        return 1
+    fi
+    read -r -p "名称前缀 [默认 device]: " prefix
+    prefix="${prefix:-device}"
+    if ! valid_client_name "$prefix"; then
+        err "名称前缀格式无效"
+        return 1
+    fi
+
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.tmp"
+    for ((i=1; i<=count; i++)); do
+        name=$(printf '%s-%02d' "$prefix" "$i")
+        existing=$(jq -r --arg name "$name" '[.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .users[] | select((.name // "") == $name)] | length' "${CONFIG_PATH}.tmp")
+        if (( existing > 0 )); then
+            warn "跳过已存在的名称: $name"
+            continue
+        fi
+        uuid="$(rand_uuid)"
+        jq --arg name "$name" --arg uuid "$uuid" '
+          .inbounds |= map(
+            if .type=="vless" and .tls.reality.enabled==true then
+              .users += [{"name": $name, "uuid": $uuid, "flow": "xtls-rprx-vision"}]
+            else . end
+          )
+        ' "${CONFIG_PATH}.tmp" > "${CONFIG_PATH}.next"
+        mv "${CONFIG_PATH}.next" "${CONFIG_PATH}.tmp"
+    done
+    commit_reality_clients_config && info "批量客户端生成完成"
+}
+
+delete_reality_client() {
+    reality_clients_enabled || return 1
+    local count number index name
+    count=$(jq -r '[.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .users[]] | length' "$CONFIG_PATH")
+    if (( count <= 1 )); then
+        err "至少需要保留一个 Reality 客户端"
+        return 1
+    fi
+    list_reality_clients
+    read -r -p "请输入要删除的序号: " number
+    if ! [[ "$number" =~ ^[0-9]+$ ]] || (( number < 1 || number > count )); then
+        err "序号无效"
+        return 1
+    fi
+    index=$((number - 1))
+    name=$(jq -r --argjson index "$index" '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .users[$index].name // ("reality-" + (($index + 1) | tostring))' "$CONFIG_PATH")
+    read -r -p "确认删除客户端 $name？(y/N): " confirm_delete
+    [[ "$confirm_delete" =~ ^[Yy]$ ]] || return 0
+
+    jq --argjson index "$index" '
+      .inbounds |= map(
+        if .type=="vless" and .tls.reality.enabled==true then del(.users[$index]) else . end
+      )
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp"
+    commit_reality_clients_config && info "已删除客户端: $name"
+}
+
+reset_reality_client_uuid() {
+    reality_clients_enabled || return 1
+    local count number index name uuid
+    count=$(jq -r '[.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .users[]] | length' "$CONFIG_PATH")
+    list_reality_clients
+    read -r -p "请输入要重置 UUID 的序号: " number
+    if ! [[ "$number" =~ ^[0-9]+$ ]] || (( number < 1 || number > count )); then
+        err "序号无效"
+        return 1
+    fi
+    index=$((number - 1))
+    name=$(jq -r --argjson index "$index" '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .users[$index].name // "reality"' "$CONFIG_PATH")
+    uuid="$(rand_uuid)"
+    jq --argjson index "$index" --arg uuid "$uuid" '
+      .inbounds |= map(
+        if .type=="vless" and .tls.reality.enabled==true then .users[$index].uuid = $uuid else . end
+      )
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp"
+    commit_reality_clients_config && info "已重置 $name 的 UUID"
+}
+
+action_reality_client_manager() {
+    reality_clients_enabled || return 1
+    echo ""
+    echo "=== Reality 客户端管理 ==="
+    echo "1) 查看全部客户端"
+    echo "2) 新增客户端"
+    echo "3) 批量生成客户端"
+    echo "4) 删除客户端"
+    echo "5) 重置客户端 UUID"
+    echo "6) 重新生成分享链接"
+    echo "0) 返回"
+    read -r -p "请选择: " client_action
+    case "$client_action" in
+        1) list_reality_clients ;;
+        2) add_reality_client ;;
+        3) batch_add_reality_clients ;;
+        4) delete_reality_client ;;
+        5) reset_reality_client_uuid ;;
+        6) generate_uris && cat /etc/sing-box/uris.txt ;;
+        0) return 0 ;;
+        *) warn "无效选项" ;;
+    esac
+}
+
 # 重置AnyTLS Reality端口
 action_reset_anytls() {
     read_config || return 1
@@ -1299,6 +1772,151 @@ action_reset_anytls() {
     service_start || warn "启动服务失败"
     sleep 1
     generate_uris || warn "生成 URI 失败"
+}
+
+# 重新优选并应用 Reality SNI
+action_change_reality_sni() {
+    read_config || return 1
+    if [ "${ENABLE_REALITY:-false}" != "true" ] && [ "${ENABLE_ANYTLS:-false}" != "true" ]; then
+        err "未启用 Reality 协议"
+        return 1
+    fi
+    if [ ! -r "$REALITY_HELPER_PATH" ]; then
+        err "未找到 Reality 优选组件: $REALITY_HELPER_PATH"
+        return 1
+    fi
+
+    local old_sni="$REALITY_SNI"
+    # shellcheck source=/usr/local/lib/sing-box/reality-sni-tools.sh
+    . "$REALITY_HELPER_PATH"
+    select_reality_sni
+    local new_sni="$REALITY_SNI"
+    if [ "$new_sni" = "$old_sni" ]; then
+        info "Reality SNI 未变化: $new_sni"
+        return 0
+    fi
+
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    jq --arg sni "$new_sni" '
+      .inbounds |= map(
+        if .tls.reality.enabled == true then
+          .tls.server_name = $sni
+          | .tls.reality.handshake.server = $sni
+        else . end
+      )
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp"
+
+    if ! sing-box check -c "${CONFIG_PATH}.tmp" >/dev/null 2>&1; then
+        rm -f "${CONFIG_PATH}.tmp"
+        err "新配置校验失败，已保留原 SNI: $old_sni"
+        return 1
+    fi
+    mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+
+    if grep -q '^REALITY_SNI=' "$CACHE_FILE" 2>/dev/null; then
+        sed -i "s|^REALITY_SNI=.*|REALITY_SNI=$new_sni|" "$CACHE_FILE"
+    else
+        printf 'REALITY_SNI=%s\n' "$new_sni" >> "$CACHE_FILE"
+    fi
+
+    service_restart
+    generate_uris || warn "客户端链接重新生成失败"
+    info "Reality SNI 已从 $old_sni 更新为 $new_sni"
+}
+
+show_bbr_status() {
+    local current_cc current_qdisc available module_state
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "不可读取")
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "不可读取")
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "不可读取")
+    if lsmod 2>/dev/null | awk '{print $1}' | grep -qx tcp_bbr; then
+        module_state="已加载"
+    elif [ -d /sys/module/tcp_bbr ]; then
+        module_state="已加载"
+    else
+        module_state="未加载或已编入内核"
+    fi
+
+    echo ""
+    echo "=== BBR 状态 ==="
+    echo "内核版本: $(uname -r)"
+    echo "当前拥塞控制: $current_cc"
+    echo "默认队列规则: $current_qdisc"
+    echo "可用拥塞控制: $available"
+    echo "tcp_bbr 模块: $module_state"
+    if [ "$current_cc" = "bbr" ]; then
+        info "BBR 已启用"
+    elif [[ " $available " == *" bbr "* ]]; then
+        warn "内核支持 BBR，但当前未启用"
+    else
+        warn "当前内核未提供 BBR，或 VPS 容器未开放该能力"
+    fi
+}
+
+enable_bbr() {
+    local available current_cc current_qdisc old_cc old_qdisc bbr_config
+    bbr_config="/etc/sysctl.d/99-singbox-bbr.conf"
+    old_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    old_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    if [[ " $available " != *" bbr "* ]]; then
+        if command -v modprobe >/dev/null 2>&1; then
+            info "尝试加载 tcp_bbr 内核模块..."
+            modprobe tcp_bbr 2>/dev/null || true
+        fi
+        available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    fi
+
+    if [[ " $available " != *" bbr "* ]]; then
+        err "当前内核或虚拟化环境不支持 BBR，未修改系统配置"
+        return 1
+    fi
+
+    cat > "$bbr_config" <<'BBR_CONFIG'
+# Managed by the sing-box sb panel.
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+BBR_CONFIG
+
+    if ! sysctl -p "$bbr_config" >/dev/null; then
+        rm -f "$bbr_config"
+        [ -n "$old_qdisc" ] && sysctl -w "net.core.default_qdisc=$old_qdisc" >/dev/null 2>&1 || true
+        [ -n "$old_cc" ] && sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null 2>&1 || true
+        err "内核拒绝应用 BBR 参数；可能是容器权限受限"
+        return 1
+    fi
+
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+    if [ "$current_cc" != "bbr" ] || [ "$current_qdisc" != "fq" ]; then
+        rm -f "$bbr_config"
+        [ -n "$old_qdisc" ] && sysctl -w "net.core.default_qdisc=$old_qdisc" >/dev/null 2>&1 || true
+        [ -n "$old_cc" ] && sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null 2>&1 || true
+        err "参数已写入，但当前拥塞控制仍为 ${current_cc:-未知}"
+        return 1
+    fi
+    info "BBR 已启用并持久化到 $bbr_config"
+    show_bbr_status
+}
+
+action_bbr_manager() {
+    echo ""
+    echo "=== BBR 管理 ==="
+    echo "1) 查看 BBR 状态"
+    echo "2) 启用 BBR"
+    echo "0) 返回"
+    read -r -p "请选择: " bbr_action
+    case "$bbr_action" in
+        1) show_bbr_status ;;
+        2)
+            warn "BBR 仅影响 TCP；Hysteria2/TUIC 等 UDP 协议不会直接受益"
+            read -r -p "确认启用并持久化 BBR？(y/N): " confirm_bbr
+            [[ "$confirm_bbr" =~ ^[Yy]$ ]] && enable_bbr
+            ;;
+        0) return 0 ;;
+        *) warn "无效选项" ;;
+    esac
 }
 
 # 更新sing-box
@@ -1336,7 +1954,8 @@ action_uninstall() {
         systemctl daemon-reload 2>/dev/null || true
         apt purge -y sing-box >/dev/null 2>&1 || true
     fi
-    rm -rf /etc/sing-box /var/log/sing-box* /usr/local/bin/sb /usr/bin/sing-box /root/node_names.txt 2>/dev/null || true
+    rm -rf /etc/sing-box /var/log/sing-box* /usr/local/bin/sb /usr/bin/sb \
+        /usr/local/lib/sing-box/reality-sni-tools.sh /usr/bin/sing-box /root/node_names.txt 2>/dev/null || true
     info "卸载完成"
 }
 
@@ -1614,11 +2233,21 @@ MENU
         echo "$option) 重置 Vless Reality 端口"
         MENU_MAP[$option]="reset_reality"
         option=$((option + 1))
+
+        echo "$option) Reality 客户端管理"
+        MENU_MAP[$option]="reality_clients"
+        option=$((option + 1))
     fi
     
     if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
         echo "$option) 重置 AnyTLS Reality 端口"
         MENU_MAP[$option]="reset_anytls"
+        option=$((option + 1))
+    fi
+
+    if [ "${ENABLE_REALITY:-false}" = "true" ] || [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
+        echo "$option) 重新优选 Reality SNI"
+        MENU_MAP[$option]="change_reality_sni"
         option=$((option + 1))
     fi
 
@@ -1637,6 +2266,10 @@ MENU
     
     MENU_MAP[$option]="status"
     echo "$((option))) 查看状态"
+    option=$((option + 1))
+
+    MENU_MAP[$option]="bbr"
+    echo "$((option))) BBR 管理"
     option=$((option + 1))
     
     MENU_MAP[$option]="update"
@@ -1679,11 +2312,14 @@ while true; do
                 reset_hy2) action_reset_hy2 ;;
                 reset_tuic) action_reset_tuic ;;
                 reset_reality) action_reset_reality ;;
+                reality_clients) action_reality_client_manager ;;
                 reset_anytls) action_reset_anytls ;;
+                change_reality_sni) action_change_reality_sni ;;
                 start) service_start && info "已启动" ;;
                 stop) service_stop && info "已停止" ;;
                 restart) service_restart && info "已重启" ;;
                 status) service_status ;;
+                bbr) action_bbr_manager ;;
                 update) action_update ;;
                 relay) action_generate_relay ;;
                 uninstall) action_uninstall; exit 0 ;;
