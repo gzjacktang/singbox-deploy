@@ -409,11 +409,40 @@ run_installed_realitlscanner() {
     [[ -s "$output_file" ]]
 }
 
+create_reality_scan_workspace() {
+    local workspace=""
+
+    # `mktemp` implementations differ on whether a suffix after XXXXXX is
+    # accepted. Prefer the implementation's default directory template, then
+    # fall back to a template whose XXXXXX sequence is at the very end.
+    if workspace="$(TMPDIR=/tmp mktemp -d 2>/dev/null)" && [[ -d "$workspace" ]]; then
+        printf '%s\n' "$workspace"
+        return 0
+    fi
+    if workspace="$(mktemp -d /tmp/singbox-reality.XXXXXX 2>/dev/null)" && [[ -d "$workspace" ]]; then
+        printf '%s\n' "$workspace"
+        return 0
+    fi
+    return 1
+}
+
+cleanup_reality_scan_workspace() {
+    local workspace="${1:-}"
+    [[ -n "$workspace" && -d "$workspace" ]] || return 0
+    rm -f "$workspace/results.tsv" "$workspace/scanner.csv"
+    rmdir "$workspace" 2>/dev/null || true
+}
+
 select_reality_sni() {
-    local choice manual csv_file scanner_csv results_file
+    local choice manual csv_file scanner_csv results_file workspace
     local -a candidates=()
-    results_file="$(mktemp /tmp/reality-scan.XXXXXX)"
-    scanner_csv="$(mktemp /tmp/realitlscanner.XXXXXX.csv)"
+    if ! workspace="$(create_reality_scan_workspace)"; then
+        warn "无法创建 Reality 扫描临时目录，使用默认 addons.mozilla.org"
+        REALITY_SNI="addons.mozilla.org"
+        return 0
+    fi
+    results_file="$workspace/results.tsv"
+    scanner_csv="$workspace/scanner.csv"
 
     echo ""
     info "=== Reality 目标站优选 ==="
@@ -451,7 +480,7 @@ select_reality_sni() {
             ;;
         5)
             REALITY_SNI="addons.mozilla.org"
-            rm -f "$results_file" "$scanner_csv"
+            cleanup_reality_scan_workspace "$workspace"
             return 0
             ;;
         6)
@@ -462,7 +491,7 @@ select_reality_sni() {
                 manual="addons.mozilla.org"
             fi
             REALITY_SNI="$manual"
-            rm -f "$results_file" "$scanner_csv"
+            cleanup_reality_scan_workspace "$workspace"
             return 0
             ;;
         *)
@@ -480,7 +509,7 @@ select_reality_sni() {
         warn "优选失败，使用 addons.mozilla.org"
         REALITY_SNI="addons.mozilla.org"
     fi
-    rm -f "$results_file" "$scanner_csv"
+    cleanup_reality_scan_workspace "$workspace"
 }
 
 # -----------------------
@@ -1211,7 +1240,8 @@ mkdir -p "$(dirname "$REALITY_HELPER_PATH")"
     printf '%s\n' 'REALITY_SCAN_ATTEMPTS=3' 'REALITY_SCAN_TIMEOUT=10' 'REALITY_SCAN_MAX_IMPORT=50'
     declare -f normalize_reality_host is_valid_reality_host reality_tls_probe_once median_latency
     declare -f scan_reality_candidate scan_reality_candidates extract_realitlscanner_candidates
-    declare -f show_and_pick_reality_result run_installed_realitlscanner select_reality_sni
+    declare -f show_and_pick_reality_result run_installed_realitlscanner
+    declare -f create_reality_scan_workspace cleanup_reality_scan_workspace select_reality_sni
 } > "$REALITY_HELPER_PATH"
 chmod 755 "$REALITY_HELPER_PATH"
 

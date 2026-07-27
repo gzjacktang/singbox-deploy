@@ -35,6 +35,8 @@
 
 RealiTLScanner 上游建议优先在本地运行。大范围 IP/CIDR 扫描可能触发云服务商风控，因此脚本不会默认扫描；调用服务器上的扫描器前会再次要求确认。CSV 导入最多取前 50 个去重后的非通配符域名进行复检。
 
+Reality 扫描临时文件使用独立随机目录创建，兼容 GNU coreutils、BusyBox/Toybox 等不同 `mktemp` 实现。输入连接 IP 或 DDNS 域名只影响客户端连接地址，不会被当作 Reality SNI。
+
 ### Reality 客户端管理
 
 安装完成后运行 `sb`，选择“Reality 客户端管理”。每个 VLESS Reality 客户端拥有独立名称和 UUID，共用当前入站的端口、Reality 公钥、Short ID 和 SNI。支持一次批量创建 1-20 个客户端；删除时至少保留一个客户端。所有增删改操作都会先通过 `sing-box check`，成功后才替换配置、重启服务并重新生成 `/etc/sing-box/uris.txt`。
