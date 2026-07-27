@@ -228,11 +228,11 @@ REALITY_SCAN_CANDIDATES=(
     "www.intel.com"
     "www.sony.com"
     "dl.google.com"
-    "addons.mozilla.org"
 )
 REALITY_SCAN_ATTEMPTS=3
 REALITY_SCAN_TIMEOUT=10
 REALITY_SCAN_MAX_IMPORT=50
+REALITY_SCAN_CONCURRENCY=5
 
 normalize_reality_host() {
     local host="${1:-}"
@@ -253,36 +253,78 @@ is_valid_reality_host() {
 
 reality_tls_probe_once() {
     local host="$1"
-    local output latency_seconds latency_ms
+    local output status=0 start_ms end_ms latency_ms group_option
+    local -a group_args=()
 
-    output=$(printf '' | timeout "$REALITY_SCAN_TIMEOUT" openssl s_client \
+    group_option="$(reality_openssl_group_args)" || {
+        printf '%s\n' "ERR|当前 OpenSSL 不支持 X25519 参数"
+        return 1
+    }
+    read -r -a group_args <<< "$group_option"
+    start_ms="$(now_millis)"
+    output=$(printf '\n' | timeout "$REALITY_SCAN_TIMEOUT" openssl s_client \
         -connect "${host}:443" \
         -servername "$host" \
         -tls1_3 \
         -alpn h2 \
-        -groups X25519 \
+        "${group_args[@]}" \
         -verify_hostname "$host" \
-        -verify_return_error 2>&1) || return 1
+        -verify_return_error 2>&1 | tr -d '\000') || status=$?
+    end_ms="$(now_millis)"
 
-    if ! grep -Eq 'Protocol *: TLSv1\.3|Protocol version: TLSv1\.3' <<< "$output"; then
+    if (( status != 0 )); then
+        if (( status == 124 || status == 137 )); then
+            printf '%s\n' "ERR|TLS 握手超时"
+        elif grep -Eqi 'unknown option|unrecognized option|unknown cipher|no groups' <<< "$output"; then
+            printf '%s\n' "ERR|OpenSSL 参数不兼容"
+        else
+            printf '%s\n' "ERR|TLS 握手失败"
+        fi
         return 1
     fi
-    if ! grep -q 'ALPN protocol: h2' <<< "$output"; then
+
+    if ! grep -Eq 'Protocol *: TLSv1\.3|Protocol version: TLSv1\.3|New, TLSv1\.3' <<< "$output"; then
+        printf '%s\n' "ERR|不支持 TLS 1.3"
+        return 1
+    fi
+    if ! grep -Eqi 'ALPN protocol: h2|Negotiated ALPN protocol: h2' <<< "$output"; then
+        printf '%s\n' "ERR|未协商 h2"
         return 1
     fi
     if ! grep -Eq 'Verify return code: 0 \(ok\)|Verification: OK' <<< "$output"; then
+        printf '%s\n' "ERR|证书校验失败"
         return 1
     fi
 
-    latency_seconds=$(curl -o /dev/null -sS \
-        --connect-timeout "$REALITY_SCAN_TIMEOUT" \
-        --max-time "$REALITY_SCAN_TIMEOUT" \
-        --tlsv1.3 \
-        -w '%{time_appconnect}' \
-        "https://${host}/" 2>/dev/null) || return 1
-    latency_ms=$(awk -v seconds="$latency_seconds" 'BEGIN { printf "%d", (seconds * 1000) + 0.5 }')
-    [[ "$latency_ms" =~ ^[0-9]+$ && "$latency_ms" -gt 0 ]] || return 1
-    printf '%s\n' "$latency_ms"
+    latency_ms=$((end_ms - start_ms))
+    (( latency_ms > 0 )) || latency_ms=1
+    printf '%s\n' "OK|$latency_ms"
+}
+
+now_millis() {
+    local value
+    value="$(date +%s%3N 2>/dev/null || true)"
+    if [[ "$value" =~ ^[0-9]{13,}$ ]]; then
+        printf '%s\n' "$value"
+    else
+        printf '%s\n' "$(( $(date +%s) * 1000 ))"
+    fi
+}
+
+reality_openssl_group_args() {
+    local help
+    if [[ -n "${REALITY_OPENSSL_GROUP_OPTION:-}" ]]; then
+        printf '%s\n' "$REALITY_OPENSSL_GROUP_OPTION"
+        return 0
+    fi
+    help="$(openssl s_client -help 2>&1 || true)"
+    if grep -q -- '-groups' <<< "$help"; then
+        printf '%s\n' '-groups X25519'
+    elif grep -q -- '-curves' <<< "$help"; then
+        printf '%s\n' '-curves X25519'
+    else
+        return 1
+    fi
 }
 
 median_latency() {
@@ -291,29 +333,37 @@ median_latency() {
 
 scan_reality_candidate() {
     local host="$1"
-    local attempt latency successes=0
+    local attempt probe latency successes=0 last_reason="未知错误"
     local -a latencies=()
 
     for ((attempt=1; attempt<=REALITY_SCAN_ATTEMPTS; attempt++)); do
-        if latency=$(reality_tls_probe_once "$host"); then
+        if probe=$(reality_tls_probe_once "$host"); then
+            latency="${probe#OK|}"
             latencies+=("$latency")
             successes=$((successes + 1))
+        else
+            last_reason="${probe#ERR|}"
         fi
     done
 
     if (( successes > 0 )); then
-        printf '%s|%s|%s\n' "$host" "$successes" "$(median_latency "${latencies[@]}")"
+        printf '%s|%s|%s|-\n' "$host" "$successes" "$(median_latency "${latencies[@]}")"
     else
-        printf '%s|0|0\n' "$host"
+        printf '%s|0|0|%s\n' "$host" "$last_reason"
     fi
 }
 
 scan_reality_candidates() {
     local results_file="$1"
     shift
-    local host record
+    local host jobs_dir index=0 active=0 job_file
     local -A seen=()
     : > "$results_file"
+    jobs_dir="${results_file}.jobs"
+    mkdir -p "$jobs_dir"
+    if REALITY_OPENSSL_GROUP_OPTION="$(reality_openssl_group_args)"; then
+        export REALITY_OPENSSL_GROUP_OPTION
+    fi
 
     for host in "$@"; do
         host="$(normalize_reality_host "$host")"
@@ -322,9 +372,21 @@ scan_reality_candidates() {
         fi
         seen[$host]=1
         info "检测 Reality 目标: $host (共 $REALITY_SCAN_ATTEMPTS 次)" >&2
-        record="$(scan_reality_candidate "$host")"
-        printf '%s\n' "$record" >> "$results_file"
+        index=$((index + 1))
+        job_file="$jobs_dir/$index"
+        scan_reality_candidate "$host" > "$job_file" &
+        active=$((active + 1))
+        if (( active >= REALITY_SCAN_CONCURRENCY )); then
+            wait
+            active=0
+        fi
     done
+    wait
+    for job_file in "$jobs_dir"/*; do
+        [[ -f "$job_file" ]] && cat "$job_file" >> "$results_file"
+    done
+    rm -f "$jobs_dir"/*
+    rmdir "$jobs_dir" 2>/dev/null || true
 
     sort -t'|' -k2,2nr -k3,3n "$results_file" -o "$results_file"
 }
@@ -355,36 +417,54 @@ extract_realitlscanner_candidates() {
 
 show_and_pick_reality_result() {
     local results_file="$1"
-    local line host successes latency index=0
+    local host successes latency reason choice
     local -a selectable=()
 
     echo ""
-    printf '%-4s %-32s %-8s %-10s %s\n' "序号" "Reality 目标" "成功率" "延迟" "状态"
-    while IFS='|' read -r host successes latency; do
+    printf '%-4s %-30s %-8s %-8s %s\n' "序号" "Reality 目标" "成功率" "延迟" "状态/原因"
+    while IFS='|' read -r host successes latency reason; do
         [[ -n "$host" ]] || continue
-        index=$((index + 1))
         if (( successes >= 2 )); then
             selectable+=("$host")
-            printf '%-4s %-32s %s/%s    %-7s %s\n' "${#selectable[@]}" "$host" "$successes" "$REALITY_SCAN_ATTEMPTS" "${latency}ms" "可用"
+            printf '%-4s %-30s %s/%s    %-7s %s\n' "${#selectable[@]}" "$host" "$successes" "$REALITY_SCAN_ATTEMPTS" "${latency}ms" "可用"
         else
-            printf '%-4s %-32s %s/%s    %-7s %s\n' "-" "$host" "$successes" "$REALITY_SCAN_ATTEMPTS" "${latency:-0}ms" "淘汰"
+            printf '%-4s %-30s %s/%s    %-7s %s\n' "-" "$host" "$successes" "$REALITY_SCAN_ATTEMPTS" "${latency:-0}ms" "${reason:-淘汰}"
         fi
     done < "$results_file"
 
     if (( ${#selectable[@]} == 0 )); then
         warn "没有候选目标通过至少 2/$REALITY_SCAN_ATTEMPTS 次严格检测"
-        return 1
+        REALITY_SNI="$(prompt_manual_reality_sni)" || return 1
+        return 0
     fi
 
     echo ""
+    echo "m) 手动输入其他 SNI"
     read -r -p "请选择目标 [默认 1]: " choice
     choice="${choice:-1}"
+    if [[ "$choice" =~ ^[Mm]$ ]]; then
+        REALITY_SNI="$(prompt_manual_reality_sni)" || return 1
+        return 0
+    fi
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#selectable[@]} )); then
-        warn "选择无效，使用排名第一的目标"
-        choice=1
+        err "选择无效"
+        return 1
     fi
     REALITY_SNI="${selectable[$((choice - 1))]}"
     return 0
+}
+
+prompt_manual_reality_sni() {
+    local manual
+    while true; do
+        read -r -p "请输入 Reality 的 SNI: " manual || return 1
+        manual="$(normalize_reality_host "$manual")"
+        if is_valid_reality_host "$manual"; then
+            printf '%s\n' "$manual"
+            return 0
+        fi
+        warn "域名格式无效，请重新输入" >&2
+    done
 }
 
 run_installed_realitlscanner() {
@@ -437,9 +517,9 @@ select_reality_sni() {
     local choice manual csv_file scanner_csv results_file workspace
     local -a candidates=()
     if ! workspace="$(create_reality_scan_workspace)"; then
-        warn "无法创建 Reality 扫描临时目录，使用默认 addons.mozilla.org"
-        REALITY_SNI="addons.mozilla.org"
-        return 0
+        warn "无法创建 Reality 扫描临时目录，请手动输入"
+        REALITY_SNI="$(prompt_manual_reality_sni)"
+        return
     fi
     results_file="$workspace/results.tsv"
     scanner_csv="$workspace/scanner.csv"
@@ -450,8 +530,7 @@ select_reality_sni() {
     echo "2) 导入 RealiTLScanner CSV 后严格复检"
     echo "3) 调用已安装的 RealiTLScanner，再严格复检"
     echo "4) 严格验证手动输入的域名"
-    echo "5) 使用默认 addons.mozilla.org"
-    echo "6) 直接手动输入，不检测"
+    echo "5) 直接手动输入，不检测"
     read -r -p "请选择 [默认 1]: " choice
 
     case "${choice:-1}" in
@@ -479,18 +558,10 @@ select_reality_sni() {
             candidates=("$manual")
             ;;
         5)
-            REALITY_SNI="addons.mozilla.org"
-            cleanup_reality_scan_workspace "$workspace"
-            return 0
-            ;;
-        6)
-            read -r -p "请输入 Reality 的 SNI: " manual
-            manual="$(normalize_reality_host "$manual")"
-            if ! is_valid_reality_host "$manual"; then
-                warn "域名格式无效，使用 addons.mozilla.org"
-                manual="addons.mozilla.org"
-            fi
-            REALITY_SNI="$manual"
+            REALITY_SNI="$(prompt_manual_reality_sni)" || {
+                cleanup_reality_scan_workspace "$workspace"
+                return 1
+            }
             cleanup_reality_scan_workspace "$workspace"
             return 0
             ;;
@@ -506,8 +577,8 @@ select_reality_sni() {
     fi
     scan_reality_candidates "$results_file" "${candidates[@]}"
     if ! show_and_pick_reality_result "$results_file"; then
-        warn "优选失败，使用 addons.mozilla.org"
-        REALITY_SNI="addons.mozilla.org"
+        cleanup_reality_scan_workspace "$workspace"
+        return 1
     fi
     cleanup_reality_scan_workspace "$workspace"
 }
@@ -525,8 +596,7 @@ if $ENABLE_REALITY || $ENABLE_ANYTLS; then
     select_reality_sni
     info "已选择 Reality SNI: $REALITY_SNI"
 else
-    # 也设默认，方便后续统一处理（若未选 reality，也写入缓存以便 sb 读取）
-    REALITY_SNI="addons.mozilla.org"
+    REALITY_SNI=""
 fi
 
 # 将用户选择写入缓存
@@ -1198,7 +1268,7 @@ $ENABLE_TUIC && echo "   TUIC 端口: $PORT_TUIC | UUID: $UUID_TUIC | 密码: $P
 $ENABLE_REALITY && echo "   Reality 端口: $PORT_REALITY | UUID: $UUID"
 $ENABLE_ANYTLS && echo "   AnyTLS 端口: $PORT_ANYTLS | 用户: $ANYTLS_USER | 密码: $ANYTLS_PSK"
 echo "   服务器: $PUB_IP"
-echo "   Reality server_name(SNI): ${REALITY_SNI:-addons.mozilla.org}"
+echo "   Reality server_name(SNI): ${REALITY_SNI:-未配置}"
 echo ""
 info "📂 文件位置:"
 echo "   配置: $CONFIG_PATH"
@@ -1236,11 +1306,11 @@ info "正在创建 sb 管理面板: $SB_PATH"
 mkdir -p "$(dirname "$REALITY_HELPER_PATH")"
 {
     printf '%s\n' '#!/usr/bin/env bash'
-    printf '%s\n' 'REALITY_SCAN_CANDIDATES=("www.cloudflare.com" "www.microsoft.com" "www.amazon.com" "aws.amazon.com" "www.samsung.com" "www.nvidia.com" "www.amd.com" "www.intel.com" "www.sony.com" "dl.google.com" "addons.mozilla.org")'
-    printf '%s\n' 'REALITY_SCAN_ATTEMPTS=3' 'REALITY_SCAN_TIMEOUT=10' 'REALITY_SCAN_MAX_IMPORT=50'
-    declare -f normalize_reality_host is_valid_reality_host reality_tls_probe_once median_latency
+    printf '%s\n' 'REALITY_SCAN_CANDIDATES=("www.cloudflare.com" "www.microsoft.com" "www.amazon.com" "aws.amazon.com" "www.samsung.com" "www.nvidia.com" "www.amd.com" "www.intel.com" "www.sony.com" "dl.google.com")'
+    printf '%s\n' 'REALITY_SCAN_ATTEMPTS=3' 'REALITY_SCAN_TIMEOUT=10' 'REALITY_SCAN_MAX_IMPORT=50' 'REALITY_SCAN_CONCURRENCY=5'
+    declare -f normalize_reality_host is_valid_reality_host now_millis reality_openssl_group_args reality_tls_probe_once median_latency
     declare -f scan_reality_candidate scan_reality_candidates extract_realitlscanner_candidates
-    declare -f show_and_pick_reality_result run_installed_realitlscanner
+    declare -f prompt_manual_reality_sni show_and_pick_reality_result run_installed_realitlscanner
     declare -f create_reality_scan_workspace cleanup_reality_scan_workspace select_reality_sni
 } > "$REALITY_HELPER_PATH"
 chmod 755 "$REALITY_HELPER_PATH"
@@ -1327,8 +1397,14 @@ read_config() {
         . "$CACHE_FILE"
     fi
     
-    # 确保有默认值
-    REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
+    # 配置文件是 SNI 的唯一真实来源，避免缓存与实际入站不一致。
+    local configured_reality_sni
+    configured_reality_sni=$(jq -r '
+        .inbounds[]?
+        | select(.tls.reality.enabled == true)
+        | .tls.server_name // .tls.reality.handshake.server // empty
+    ' "$CONFIG_PATH" | head -n1)
+    REALITY_SNI="${configured_reality_sni:-${REALITY_SNI:-}}"
     REALITY_PUB="${REALITY_PUB:-}"
     REALITY_SID="${REALITY_SID:-}"
     ENABLE_ANYTLS="${ENABLE_ANYTLS:-false}"
@@ -1428,7 +1504,10 @@ generate_uris() {
     fi
     
     if [ "${ENABLE_REALITY:-false}" = "true" ]; then
-        REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
+        if [ -z "${REALITY_SNI:-}" ]; then
+            err "Reality 配置缺少 SNI，无法生成客户端链接"
+            return 1
+        fi
         echo "=== VLESS Reality ===" >> "$URI_FILE"
         while IFS=$'\t' read -r client_name client_uuid; do
             [ -n "$client_uuid" ] || continue
@@ -1610,7 +1689,11 @@ load_or_create_reality_material() {
             err "已有 Reality 入站，但公共密钥或 Short ID 文件缺失，无法安全复用"
             return 1
         fi
-        NEW_REALITY_SNI="${NEW_REALITY_SNI:-${REALITY_SNI:-addons.mozilla.org}}"
+        NEW_REALITY_SNI="${NEW_REALITY_SNI:-${REALITY_SNI:-}}"
+        if [[ -z "$NEW_REALITY_SNI" ]]; then
+            err "已有 Reality 入站缺少 SNI"
+            return 1
+        fi
         normalize_new_reality_sni || return 1
         return 0
     fi
@@ -1634,8 +1717,10 @@ load_or_create_reality_material() {
         select_reality_sni
         NEW_REALITY_SNI="$REALITY_SNI"
     else
-        read -r -p "请输入 Reality SNI [默认 addons.mozilla.org]: " NEW_REALITY_SNI
-        NEW_REALITY_SNI="${NEW_REALITY_SNI:-addons.mozilla.org}"
+        while true; do
+            read -r -p "请输入 Reality SNI: " NEW_REALITY_SNI || return 1
+            normalize_new_reality_sni && break
+        done
     fi
     normalize_new_reality_sni
 }
@@ -2242,6 +2327,7 @@ action_change_reality_sni() {
     fi
 
     cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    cp "$CACHE_FILE" "${CACHE_FILE}.bak" 2>/dev/null || true
     jq --arg sni "$new_sni" '
       .inbounds |= map(
         if .tls.reality.enabled == true then
@@ -2258,13 +2344,29 @@ action_change_reality_sni() {
     fi
     mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
 
-    if grep -q '^REALITY_SNI=' "$CACHE_FILE" 2>/dev/null; then
-        sed -i "s|^REALITY_SNI=.*|REALITY_SNI=$new_sni|" "$CACHE_FILE"
-    else
-        printf 'REALITY_SNI=%s\n' "$new_sni" >> "$CACHE_FILE"
+    set_config_kv "$CACHE_FILE" REALITY_SNI "$new_sni"
+
+    local saved_snis
+    saved_snis=$(jq -r '
+      [.inbounds[]? | select(.tls.reality.enabled == true)] as $all
+      | [$all[] | select(.tls.server_name == $sni and .tls.reality.handshake.server == $sni)] as $matching
+      | select(($all | length) > 0 and ($all | length) == ($matching | length))
+      | $matching | length
+    ' --arg sni "$new_sni" "$CONFIG_PATH")
+    if [[ -z "$saved_snis" || "$saved_snis" -lt 1 ]]; then
+        cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+        [ -f "${CACHE_FILE}.bak" ] && cp "${CACHE_FILE}.bak" "$CACHE_FILE"
+        err "SNI 未成功写入 Reality 配置，已恢复原配置"
+        return 1
     fi
 
-    service_restart
+    if ! service_restart; then
+        cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+        [ -f "${CACHE_FILE}.bak" ] && cp "${CACHE_FILE}.bak" "$CACHE_FILE"
+        service_restart || true
+        err "服务重启失败，已恢复原 SNI: $old_sni"
+        return 1
+    fi
     generate_uris || warn "客户端链接重新生成失败"
     info "Reality SNI 已从 $old_sni 更新为 $new_sni"
 }
@@ -2620,7 +2722,11 @@ RELAY_EOF
     sed -i "s|__INBOUND_PORT__|$SS_PORT|g" "$RELAY_SCRIPT"
     sed -i "s|__INBOUND_METHOD__|$SS_METHOD|g" "$RELAY_SCRIPT"
     sed -i "s|__INBOUND_PASSWORD__|$SS_PSK|g" "$RELAY_SCRIPT"
-    sed -i "s|__REALITY_SNI__|${REALITY_SNI:-addons.mozilla.org}|g" "$RELAY_SCRIPT"
+    if [[ -z "${REALITY_SNI:-}" ]]; then
+        err "Reality SNI 为空，无法生成线路机脚本"
+        return 1
+    fi
+    sed -i "s|__REALITY_SNI__|$REALITY_SNI|g" "$RELAY_SCRIPT"
     
     chmod +x "$RELAY_SCRIPT"
     

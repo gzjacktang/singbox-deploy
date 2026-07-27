@@ -34,10 +34,10 @@ mktemp() {
 }
 
 REALITY_SNI=""
-select_reality_sni <<< "5"
+select_reality_sni <<< $'5\nmanual.example.com'
 
-if [[ "$REALITY_SNI" != "addons.mozilla.org" ]]; then
-    echo "expected addons.mozilla.org, got: $REALITY_SNI" >&2
+if [[ "$REALITY_SNI" != "manual.example.com" ]]; then
+    echo "expected manual.example.com, got: $REALITY_SNI" >&2
     exit 1
 fi
 

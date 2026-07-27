@@ -180,4 +180,51 @@ grep -qx 'REALITY_SNI=www.example.com' "$CACHE_FILE"
 grep -qx 'public-key' "$REALITY_PUBLIC_FILE"
 grep -qx 'a1b2c3d4' "$REALITY_SID_FILE"
 
+cat > "$CONFIG_PATH" <<'JSON'
+{
+  "inbounds": [
+    {
+      "type": "vless",
+      "listen_port": 24567,
+      "users": [{"name":"default","uuid":"22222222-2222-4222-8222-222222222222"}],
+      "tls": {
+        "server_name": "www.example.com",
+        "reality": {
+          "enabled": true,
+          "handshake": {"server":"www.example.com","server_port":443},
+          "private_key":"private-key",
+          "short_id":["a1b2c3d4"]
+        }
+      }
+    }
+  ],
+  "outbounds": [{"type":"direct"}]
+}
+JSON
+cat > "$PROTOCOL_FILE" <<'FLAGS'
+ENABLE_SS=false
+ENABLE_HY2=false
+ENABLE_TUIC=false
+ENABLE_REALITY=true
+ENABLE_ANYTLS=false
+FLAGS
+cat > "$CACHE_FILE" <<'CACHE'
+ENABLE_REALITY=true
+ENABLE_ANYTLS=false
+REALITY_SNI=stale-cache.example.com
+CUSTOM_IP=node.example.net
+CACHE
+REALITY_HELPER_PATH="$workspace/reality-helper.sh"
+cat > "$REALITY_HELPER_PATH" <<'HELPER'
+select_reality_sni() {
+    REALITY_SNI="manual.changed.example"
+}
+HELPER
+action_change_reality_sni
+jq -e '
+  .inbounds[0].tls.server_name == "manual.changed.example"
+  and .inbounds[0].tls.reality.handshake.server == "manual.changed.example"
+' "$CONFIG_PATH" >/dev/null
+grep -qx 'REALITY_SNI=manual.changed.example' "$CACHE_FILE"
+
 echo "add node manager tests passed"
