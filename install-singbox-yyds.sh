@@ -1255,6 +1255,10 @@ err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
 CONFIG_PATH="/etc/sing-box/config.json"
 CACHE_FILE="/etc/sing-box/.config_cache"
+PROTOCOL_FILE="/etc/sing-box/.protocols"
+REALITY_PUBLIC_FILE="/etc/sing-box/.reality_pub"
+REALITY_SID_FILE="/etc/sing-box/.reality_sid"
+URI_FILE="/etc/sing-box/uris.txt"
 REALITY_HELPER_PATH="/usr/local/lib/sing-box/reality-sni-tools.sh"
 SERVICE_NAME="sing-box"
 
@@ -1314,7 +1318,6 @@ read_config() {
     fi
     
     # 优先加载 .protocols 文件（确认协议标记）
-    PROTOCOL_FILE="/etc/sing-box/.protocols"
     if [ -f "$PROTOCOL_FILE" ]; then
         . "$PROTOCOL_FILE"
     fi
@@ -1326,6 +1329,8 @@ read_config() {
     
     # 确保有默认值
     REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
+    REALITY_PUB="${REALITY_PUB:-}"
+    REALITY_SID="${REALITY_SID:-}"
     ENABLE_ANYTLS="${ENABLE_ANYTLS:-false}"
     CUSTOM_IP="${CUSTOM_IP:-}"
 
@@ -1355,20 +1360,20 @@ if [ "${ENABLE_REALITY:-false}" = "true" ] || [ "${ENABLE_ANYTLS:-false}" = "tru
         | .tls.reality.short_id[0] // empty
     ' "$CONFIG_PATH" | head -n1)
 
-    [ -f /etc/sing-box/.reality_pub ] && REALITY_PUB=$(cat /etc/sing-box/.reality_pub)
+    [ -f "$REALITY_PUBLIC_FILE" ] && REALITY_PUB=$(cat "$REALITY_PUBLIC_FILE")
 fi
 
 # VLESS Reality 专属参数
     if [ "${ENABLE_REALITY:-false}" = "true" ]; then
-        REALITY_PORT=$(jq -r '.inbounds[] | select(.type=="vless") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+        REALITY_PORT=$(jq -r '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
 
-        REALITY_PK=$(jq -r '.inbounds[] | select(.type=="vless") | .tls.reality.private_key // empty' "$CONFIG_PATH" | head -n1)
+        REALITY_PK=$(jq -r '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .tls.reality.private_key // empty' "$CONFIG_PATH" | head -n1)
 fi
 
 if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
-    ANYTLS_PORT=$(jq -r '.inbounds[] | select(.type=="anytls") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
-    ANYTLS_USER=$(jq -r '.inbounds[] | select(.type=="anytls") | .users[0].name // empty' "$CONFIG_PATH" | head -n1)
-    ANYTLS_PSK=$(jq -r '.inbounds[] | select(.type=="anytls") | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
+    ANYTLS_PORT=$(jq -r '.inbounds[] | select(.type=="anytls" and .tls.reality.enabled==true) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+    ANYTLS_USER=$(jq -r '.inbounds[] | select(.type=="anytls" and .tls.reality.enabled==true) | .users[0].name // empty' "$CONFIG_PATH" | head -n1)
+    ANYTLS_PSK=$(jq -r '.inbounds[] | select(.type=="anytls" and .tls.reality.enabled==true) | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
 fi
 }
 
@@ -1395,7 +1400,6 @@ generate_uris() {
 
     node_suffix=$(cat /root/node_names.txt 2>/dev/null || echo "")
     
-    URI_FILE="/etc/sing-box/uris.txt"
     > "$URI_FILE"
     
     if [ "${ENABLE_SS:-false}" = "true" ]; then
@@ -1431,7 +1435,7 @@ generate_uris() {
             client_name="${client_name:-reality}"
             client_label=$(url_encode "${client_name}${node_suffix}")
             echo "vless://${client_uuid}@${PUBLIC_IP}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#${client_label}" >> "$URI_FILE"
-        done < <(jq -r '.inbounds[] | select(.type=="vless") | .users[] | [(.name // "reality"), .uuid] | @tsv' "$CONFIG_PATH")
+        done < <(jq -r '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .users[] | [(.name // "reality"), .uuid] | @tsv' "$CONFIG_PATH")
         echo "" >> "$URI_FILE"
     fi
     
@@ -1477,6 +1481,417 @@ action_edit_config() {
             warn "配置校验失败,服务未重启"
         fi
     fi
+}
+
+set_config_kv() {
+    local file="$1" key="$2" value="$3"
+    touch "$file"
+    if grep -q "^${key}=" "$file" 2>/dev/null; then
+        awk -F= -v key="$key" -v value="$value" '
+          $1 == key { print key "=" value; next }
+          { print }
+        ' "$file" > "${file}.kv.tmp"
+        mv "${file}.kv.tmp" "$file"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$file"
+    fi
+}
+
+protocol_inbound_exists() {
+    local type="$1"
+    jq -e --arg type "$type" '.inbounds[]? | select(.type == $type)' "$CONFIG_PATH" >/dev/null
+}
+
+reality_vless_inbound_exists() {
+    jq -e '.inbounds[]? | select(.type == "vless" and .tls.reality.enabled == true)' "$CONFIG_PATH" >/dev/null
+}
+
+reality_anytls_inbound_exists() {
+    jq -e '.inbounds[]? | select(.type == "anytls" and .tls.reality.enabled == true)' "$CONFIG_PATH" >/dev/null
+}
+
+port_is_available() {
+    local port="$1" port_hex
+    if jq -e --argjson port "$port" '.inbounds[]? | select(.listen_port == $port)' "$CONFIG_PATH" >/dev/null; then
+        return 1
+    fi
+    if command -v ss >/dev/null 2>&1; then
+        if ss -H -lntu 2>/dev/null | awk -v suffix=":${port}" '$5 ~ (suffix "$") { found=1 } END { exit !found }'; then
+            return 1
+        fi
+    else
+        # Minimal containers may not ship iproute2/ss. Linux exposes bound
+        # sockets in /proc; TCP LISTEN is state 0A and UDP bound is state 07.
+        port_hex=$(printf '%04X' "$port")
+        if awk -v suffix=":${port_hex}" '
+          $2 ~ (suffix "$") && ($4 == "0A" || $4 == "07") { found=1 }
+          END { exit !found }
+        ' /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null; then
+            return 1
+        fi
+    fi
+    return 0
+}
+
+prompt_new_node_port() {
+    local label="$1" requested port attempts=0
+    read -r -p "请输入 ${label} 端口（留空自动选择）: " requested
+    if [[ -n "$requested" ]]; then
+        if ! [[ "$requested" =~ ^[0-9]+$ ]] || (( requested < 1 || requested > 65535 )); then
+            err "端口必须是 1-65535 的数字"
+            return 1
+        fi
+        if ! port_is_available "$requested"; then
+            err "端口 $requested 已被配置或占用"
+            return 1
+        fi
+        printf '%s\n' "$requested"
+        return 0
+    fi
+
+    while (( attempts < 100 )); do
+        port="$(rand_port)"
+        if port_is_available "$port"; then
+            printf '%s\n' "$port"
+            return 0
+        fi
+        attempts=$((attempts + 1))
+    done
+    err "无法找到可用随机端口"
+    return 1
+}
+
+ensure_shared_tls_certificate() {
+    local cert_dir="/etc/sing-box/certs"
+    if [[ -s "$cert_dir/fullchain.pem" && -s "$cert_dir/privkey.pem" ]]; then
+        return 0
+    fi
+    info "生成 HY2/TUIC 共用自签证书..."
+    mkdir -p "$cert_dir"
+    openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$cert_dir/privkey.pem" \
+        -out "$cert_dir/fullchain.pem" \
+        -days 3650 \
+        -subj "/CN=www.bing.com" >/dev/null 2>&1 || {
+        err "证书生成失败"
+        return 1
+    }
+    chmod 600 "$cert_dir/privkey.pem"
+    chmod 644 "$cert_dir/fullchain.pem"
+}
+
+valid_reality_sni_value() {
+    local value="${1:-}"
+    [[
+        -n "$value"
+        && ${#value} -le 253
+        && "$value" != \*.*
+        && "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$
+        && "$value" == *.*
+    ]]
+}
+
+normalize_new_reality_sni() {
+    NEW_REALITY_SNI=$(printf '%s' "${NEW_REALITY_SNI:-}" | tr '[:upper:]' '[:lower:]')
+    if ! valid_reality_sni_value "$NEW_REALITY_SNI"; then
+        err "Reality SNI 格式无效"
+        return 1
+    fi
+}
+
+load_or_create_reality_material() {
+    NEW_REALITY_PRIVATE=$(jq -r '.inbounds[]? | select(.tls.reality.enabled == true) | .tls.reality.private_key // empty' "$CONFIG_PATH" | head -n1)
+    NEW_REALITY_SID=$(jq -r '.inbounds[]? | select(.tls.reality.enabled == true) | .tls.reality.short_id[0] // empty' "$CONFIG_PATH" | head -n1)
+    NEW_REALITY_SNI=$(jq -r '.inbounds[]? | select(.tls.reality.enabled == true) | .tls.server_name // empty' "$CONFIG_PATH" | head -n1)
+    NEW_REALITY_PUBLIC=$(cat "$REALITY_PUBLIC_FILE" 2>/dev/null || true)
+
+    if [[ -n "$NEW_REALITY_PRIVATE" ]]; then
+        if [[ -z "$NEW_REALITY_PUBLIC" || -z "$NEW_REALITY_SID" ]]; then
+            err "已有 Reality 入站，但公共密钥或 Short ID 文件缺失，无法安全复用"
+            return 1
+        fi
+        NEW_REALITY_SNI="${NEW_REALITY_SNI:-${REALITY_SNI:-addons.mozilla.org}}"
+        normalize_new_reality_sni || return 1
+        return 0
+    fi
+
+    local keys
+    keys=$(sing-box generate reality-keypair 2>&1) || {
+        err "Reality 密钥生成失败"
+        return 1
+    }
+    NEW_REALITY_PRIVATE=$(printf '%s\n' "$keys" | awk '/PrivateKey/ {print $NF; exit}' | tr -d '\r')
+    NEW_REALITY_PUBLIC=$(printf '%s\n' "$keys" | awk '/PublicKey/ {print $NF; exit}' | tr -d '\r')
+    NEW_REALITY_SID=$(sing-box generate rand 8 --hex 2>/dev/null) || return 1
+    if [[ -z "$NEW_REALITY_PRIVATE" || -z "$NEW_REALITY_PUBLIC" || -z "$NEW_REALITY_SID" ]]; then
+        err "Reality 密钥生成结果为空"
+        return 1
+    fi
+
+    if [[ -r "$REALITY_HELPER_PATH" ]]; then
+        # shellcheck source=/usr/local/lib/sing-box/reality-sni-tools.sh
+        . "$REALITY_HELPER_PATH"
+        select_reality_sni
+        NEW_REALITY_SNI="$REALITY_SNI"
+    else
+        read -r -p "请输入 Reality SNI [默认 addons.mozilla.org]: " NEW_REALITY_SNI
+        NEW_REALITY_SNI="${NEW_REALITY_SNI:-addons.mozilla.org}"
+    fi
+    normalize_new_reality_sni
+}
+
+append_new_node_config() {
+    local protocol="$1" port="$2" secret="$3" extra1="${4:-}" extra2="${5:-}" extra3="${6:-}"
+    case "$protocol" in
+        ss)
+            jq --argjson port "$port" --arg password "$secret" --arg method "$extra1" '
+              .inbounds += [{
+                "type": "shadowsocks", "tag": "ss-in", "listen": "::",
+                "listen_port": $port, "method": $method, "password": $password
+              }]
+            ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp"
+            ;;
+        hy2)
+            jq --argjson port "$port" --arg password "$secret" '
+              .inbounds += [{
+                "type": "hysteria2", "tag": "hy2-in", "listen": "::",
+                "listen_port": $port, "users": [{"password": $password}],
+                "tls": {
+                  "enabled": true, "alpn": ["h3"],
+                  "certificate_path": "/etc/sing-box/certs/fullchain.pem",
+                  "key_path": "/etc/sing-box/certs/privkey.pem"
+                }
+              }]
+            ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp"
+            ;;
+        tuic)
+            jq --argjson port "$port" --arg password "$secret" --arg uuid "$extra1" '
+              .inbounds += [{
+                "type": "tuic", "tag": "tuic-in", "listen": "::",
+                "listen_port": $port,
+                "users": [{"uuid": $uuid, "password": $password}],
+                "congestion_control": "bbr",
+                "tls": {
+                  "enabled": true, "alpn": ["h3"],
+                  "certificate_path": "/etc/sing-box/certs/fullchain.pem",
+                  "key_path": "/etc/sing-box/certs/privkey.pem"
+                }
+              }]
+            ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp"
+            ;;
+        vless)
+            jq --argjson port "$port" --arg uuid "$secret" --arg private "$extra1" --arg sid "$extra2" --arg sni "$extra3" '
+              .inbounds += [{
+                "type": "vless", "tag": "vless-in", "listen": "::",
+                "listen_port": $port,
+                "users": [{"name": "default", "uuid": $uuid, "flow": "xtls-rprx-vision"}],
+                "tls": {
+                  "enabled": true, "server_name": $sni,
+                  "reality": {
+                    "enabled": true,
+                    "handshake": {"server": $sni, "server_port": 443},
+                    "private_key": $private, "short_id": [$sid]
+                  }
+                }
+              }]
+            ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp"
+            ;;
+        anytls)
+            jq --argjson port "$port" --arg password "$secret" --arg user "$extra1" --arg private "$extra2" --argjson reality "$extra3" '
+              .inbounds += [{
+                "type": "anytls", "tag": "anytls-in", "listen": "::",
+                "listen_port": $port,
+                "users": [{"name": $user, "password": $password}],
+                "padding_scheme": [],
+                "tls": {
+                  "enabled": true, "server_name": $reality.sni,
+                  "reality": {
+                    "enabled": true,
+                    "handshake": {"server": $reality.sni, "server_port": 443},
+                    "private_key": $private, "short_id": [$reality.sid]
+                  }
+                }
+              }]
+            ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+commit_new_node() {
+    local enable_key="$1"
+    local reality_public="${2:-}" reality_sid="${3:-}" reality_sni="${4:-}"
+    local protocol_file="$PROTOCOL_FILE"
+    local public_file="$REALITY_PUBLIC_FILE"
+    local sid_file="$REALITY_SID_FILE"
+    local had_cache=false had_protocols=false had_public=false had_sid=false
+    if ! sing-box check -c "${CONFIG_PATH}.tmp" >/dev/null 2>&1; then
+        rm -f "${CONFIG_PATH}.tmp"
+        err "新增节点配置校验失败，原配置未修改"
+        return 1
+    fi
+
+    [[ -f "$CACHE_FILE" ]] && had_cache=true
+    [[ -f "$protocol_file" ]] && had_protocols=true
+    [[ -f "$public_file" ]] && had_public=true
+    [[ -f "$sid_file" ]] && had_sid=true
+
+    # Build every auxiliary file off to the side before replacing live state.
+    if [[ -f "$CACHE_FILE" ]]; then
+        cp "$CACHE_FILE" "${CACHE_FILE}.node.tmp"
+    else
+        : > "${CACHE_FILE}.node.tmp"
+    fi
+    if [[ -f "$protocol_file" ]]; then
+        cp "$protocol_file" "${protocol_file}.node.tmp"
+    else
+        : > "${protocol_file}.node.tmp"
+    fi
+    set_config_kv "${CACHE_FILE}.node.tmp" "$enable_key" "true"
+    set_config_kv "${protocol_file}.node.tmp" "$enable_key" "true"
+    if [[ -n "$reality_public" ]]; then
+        printf '%s' "$reality_public" > "${public_file}.node.tmp"
+        printf '%s' "$reality_sid" > "${sid_file}.node.tmp"
+        set_config_kv "${CACHE_FILE}.node.tmp" REALITY_SNI "$reality_sni"
+    fi
+
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    rm -f "${CACHE_FILE}.bak" "${protocol_file}.bak" "${public_file}.bak" "${sid_file}.bak"
+    $had_cache && cp "$CACHE_FILE" "${CACHE_FILE}.bak"
+    $had_protocols && cp "$protocol_file" "${protocol_file}.bak"
+    $had_public && cp "$public_file" "${public_file}.bak"
+    $had_sid && cp "$sid_file" "${sid_file}.bak"
+
+    mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    mv "${CACHE_FILE}.node.tmp" "$CACHE_FILE"
+    mv "${protocol_file}.node.tmp" "$protocol_file"
+    if [[ -n "$reality_public" ]]; then
+        mv "${public_file}.node.tmp" "$public_file"
+        mv "${sid_file}.node.tmp" "$sid_file"
+    fi
+
+    if ! service_restart; then
+        cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+        if $had_cache; then
+            cp "${CACHE_FILE}.bak" "$CACHE_FILE"
+        else
+            rm -f "$CACHE_FILE"
+        fi
+        if $had_protocols; then
+            cp "${protocol_file}.bak" "$protocol_file"
+        else
+            rm -f "$protocol_file"
+        fi
+        if $had_public; then
+            cp "${public_file}.bak" "$public_file"
+        else
+            rm -f "$public_file"
+        fi
+        if $had_sid; then
+            cp "${sid_file}.bak" "$sid_file"
+        else
+            rm -f "$sid_file"
+        fi
+        service_restart || true
+        err "服务启动失败，已恢复新增前配置"
+        return 1
+    fi
+    generate_uris || warn "节点已创建，但链接重新生成失败"
+}
+
+add_ss_node() {
+    protocol_inbound_exists "shadowsocks" && { warn "Shadowsocks 节点已存在"; return 0; }
+    local port password method_choice method
+    port="$(prompt_new_node_port "SS")" || return 1
+    echo "1) 2022-blake3-aes-128-gcm（推荐）"
+    echo "2) aes-128-gcm"
+    read -r -p "请选择加密方式 [默认 1]: " method_choice
+    [[ "${method_choice:-1}" == "2" ]] && method="aes-128-gcm" || method="2022-blake3-aes-128-gcm"
+    password="$(rand_pass)"
+    append_new_node_config ss "$port" "$password" "$method"
+    if commit_new_node ENABLE_SS; then
+        info "Shadowsocks 节点创建成功，端口: $port"
+        cat /etc/sing-box/uris.txt
+    fi
+}
+
+add_hy2_node() {
+    protocol_inbound_exists "hysteria2" && { warn "Hysteria2 节点已存在"; return 0; }
+    local port password
+    port="$(prompt_new_node_port "HY2")" || return 1
+    ensure_shared_tls_certificate || return 1
+    password="$(rand_pass)"
+    append_new_node_config hy2 "$port" "$password"
+    if commit_new_node ENABLE_HY2; then
+        info "Hysteria2 节点创建成功，端口: $port"
+        cat /etc/sing-box/uris.txt
+    fi
+}
+
+add_tuic_node() {
+    protocol_inbound_exists "tuic" && { warn "TUIC 节点已存在"; return 0; }
+    local port password uuid
+    port="$(prompt_new_node_port "TUIC")" || return 1
+    ensure_shared_tls_certificate || return 1
+    password="$(rand_pass)"
+    uuid="$(rand_uuid)"
+    append_new_node_config tuic "$port" "$password" "$uuid"
+    if commit_new_node ENABLE_TUIC; then
+        info "TUIC 节点创建成功，端口: $port"
+        cat /etc/sing-box/uris.txt
+    fi
+}
+
+add_vless_reality_node() {
+    reality_vless_inbound_exists && { warn "VLESS Reality 节点已存在，请使用客户端管理新增 UUID"; return 0; }
+    local port uuid
+    port="$(prompt_new_node_port "VLESS Reality")" || return 1
+    load_or_create_reality_material || return 1
+    uuid="$(rand_uuid)"
+    append_new_node_config vless "$port" "$uuid" "$NEW_REALITY_PRIVATE" "$NEW_REALITY_SID" "$NEW_REALITY_SNI"
+    if commit_new_node ENABLE_REALITY "$NEW_REALITY_PUBLIC" "$NEW_REALITY_SID" "$NEW_REALITY_SNI"; then
+        info "VLESS Reality 节点创建成功，端口: $port"
+        cat /etc/sing-box/uris.txt
+    fi
+}
+
+add_anytls_reality_node() {
+    reality_anytls_inbound_exists && { warn "AnyTLS Reality 节点已存在"; return 0; }
+    local port password user reality_json
+    port="$(prompt_new_node_port "AnyTLS Reality")" || return 1
+    load_or_create_reality_material || return 1
+    password="$(rand_pass)"
+    user="$(openssl rand -hex 4)"
+    reality_json=$(jq -nc --arg sid "$NEW_REALITY_SID" --arg sni "$NEW_REALITY_SNI" '{sid:$sid,sni:$sni}')
+    append_new_node_config anytls "$port" "$password" "$user" "$NEW_REALITY_PRIVATE" "$reality_json"
+    if commit_new_node ENABLE_ANYTLS "$NEW_REALITY_PUBLIC" "$NEW_REALITY_SID" "$NEW_REALITY_SNI"; then
+        info "AnyTLS Reality 节点创建成功，端口: $port"
+        cat /etc/sing-box/uris.txt
+    fi
+}
+
+action_add_node() {
+    read_config || return 1
+    echo ""
+    echo "=== 新建节点 ==="
+    echo "1) Shadowsocks (SS)"
+    echo "2) Hysteria2 (HY2)"
+    echo "3) TUIC"
+    echo "4) VLESS Reality"
+    echo "5) AnyTLS Reality"
+    echo "0) 返回"
+    read -r -p "请选择: " node_choice
+    case "$node_choice" in
+        1) add_ss_node ;;
+        2) add_hy2_node ;;
+        3) add_tuic_node ;;
+        4) add_vless_reality_node ;;
+        5) add_anytls_reality_node ;;
+        0) return 0 ;;
+        *) warn "无效选项" ;;
+    esac
 }
 
 # 重置SS端口
@@ -1578,7 +1993,7 @@ action_reset_reality() {
     cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
     
     jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="vless" then .listen_port = $port else . end)
+    .inbounds |= map(if .type=="vless" and .tls.reality.enabled==true then .listen_port = $port else . end)
     ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     
     info "已启动服务并更新 Vless Reality 端口: $new_port"
@@ -1654,7 +2069,7 @@ add_reality_client() {
         err "UUID 格式无效"
         return 1
     fi
-    if jq -e --arg uuid "$uuid" '.inbounds[] | select(.type=="vless") | .users[] | select(.uuid == $uuid)' "$CONFIG_PATH" >/dev/null; then
+    if jq -e --arg uuid "$uuid" '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .users[] | select(.uuid == $uuid)' "$CONFIG_PATH" >/dev/null; then
         err "UUID 已存在"
         return 1
     fi
@@ -1795,7 +2210,7 @@ action_reset_anytls() {
     cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
 
     jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="anytls" then .listen_port = $port else . end)
+    .inbounds |= map(if .type=="anytls" and .tls.reality.enabled==true then .listen_port = $port else . end)
     ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
 
     info "已启动服务并更新 AnyTLS Reality 端口: $new_port"
@@ -2240,6 +2655,10 @@ MENU
     # 构建协议重置选项映射
     declare -g -A MENU_MAP
     local option=4
+
+    echo "$option) 新建节点"
+    MENU_MAP[$option]="add_node"
+    option=$((option + 1))
     
     if [ "${ENABLE_SS:-false}" = "true" ]; then
         echo "$option) 重置 SS 端口"
@@ -2338,6 +2757,7 @@ while true; do
             # 处理动态选项
             action="${MENU_MAP[$opt]:-}"
             case "$action" in
+                add_node) action_add_node ;;
                 reset_ss) action_reset_ss ;;
                 reset_hy2) action_reset_hy2 ;;
                 reset_tuic) action_reset_tuic ;;
