@@ -98,5 +98,5 @@ Reality 扫描临时文件使用独立随机目录创建，兼容 GNU coreutils�
 安装全功能 sing-box（始终从 `main` 获取最新部署脚本和官方最新稳定内核）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/gzjacktang/singbox-deploy/main/install-singbox-yyds.sh | bash
+curl -fsSLo /tmp/install-singbox-yyds.sh https://raw.githubusercontent.com/gzjacktang/singbox-deploy/main/install-singbox-yyds.sh && bash -n /tmp/install-singbox-yyds.sh && bash /tmp/install-singbox-yyds.sh
 ```
