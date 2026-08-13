@@ -95,7 +95,8 @@ Reality 扫描临时文件使用独立随机目录创建，兼容 GNU coreutils�
 
 ## ✅ 一键部署命令
 
-安装全功能 sing-box：
+安装全功能 sing-box（始终从 `main` 获取最新部署脚本和官方最新稳定内核）：
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/gzjacktang/singbox-deploy/main/install-singbox-yyds.sh)"
+curl -fsSL https://raw.githubusercontent.com/gzjacktang/singbox-deploy/main/install-singbox-yyds.sh | bash
+```

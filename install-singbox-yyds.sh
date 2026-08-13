@@ -7,6 +7,10 @@ info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
+install_singbox_core() {
+    curl -fsSL https://sing-box.app/install.sh | bash
+}
+
 # -----------------------
 # 检测系统类型
 detect_os() {
@@ -735,7 +739,7 @@ install_singbox() {
             }
             ;;
         debian|redhat)
-            bash <(curl -fsSL https://sing-box.app/install.sh) || {
+            install_singbox_core || {
                 err "sing-box 安装失败"
                 exit 1
             }
@@ -2470,9 +2474,9 @@ action_bbr_manager() {
 action_update() {
     info "开始更新 sing-box..."
     if [ "$OS" = "alpine" ]; then
-        apk update && apk upgrade sing-box || bash <(curl -fsSL https://sing-box.app/install.sh)
+        apk update && apk upgrade sing-box || install_singbox_core
     else
-        bash <(curl -fsSL https://sing-box.app/install.sh)
+        install_singbox_core
     fi
     
     info "更新完成,已重启服务..."
@@ -2613,7 +2617,7 @@ esac
 info "安装 sing-box..."
 case "$OS" in
     alpine) apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box ;;
-    *) bash <(curl -fsSL https://sing-box.app/install.sh) ;;
+    *) curl -fsSL https://sing-box.app/install.sh | bash ;;
 esac
 
 UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "00000000-0000-0000-0000-000000000000")
