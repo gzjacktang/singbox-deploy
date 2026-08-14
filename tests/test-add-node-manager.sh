@@ -180,6 +180,27 @@ grep -qx 'REALITY_SNI=www.example.com' "$CACHE_FILE"
 grep -qx 'public-key' "$REALITY_PUBLIC_FILE"
 grep -qx 'a1b2c3d4' "$REALITY_SID_FILE"
 
+write_base_config
+append_new_node_config ss 23456 "ss-secret" "2022-blake3-aes-128-gcm"
+commit_new_node ENABLE_SS
+delete_existing_node ss ENABLE_SS
+jq -e '.inbounds | length == 0' "$CONFIG_PATH" >/dev/null
+grep -qx 'ENABLE_SS=false' "$CACHE_FILE"
+grep -qx 'ENABLE_SS=false' "$PROTOCOL_FILE"
+
+write_base_config
+append_new_node_config ss 23456 "ss-secret" "2022-blake3-aes-128-gcm"
+commit_new_node ENABLE_SS
+service_restart() { return 1; }
+if delete_existing_node ss ENABLE_SS; then
+    echo "delete should fail when service restart fails" >&2
+    exit 1
+fi
+jq -e '.inbounds[0].type == "shadowsocks"' "$CONFIG_PATH" >/dev/null
+grep -qx 'ENABLE_SS=true' "$CACHE_FILE"
+grep -qx 'ENABLE_SS=true' "$PROTOCOL_FILE"
+service_restart() { return 0; }
+
 cat > "$CONFIG_PATH" <<'JSON'
 {
   "inbounds": [

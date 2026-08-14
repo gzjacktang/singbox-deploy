@@ -1983,6 +1983,93 @@ action_add_node() {
     esac
 }
 
+node_kind_exists() {
+    local kind="$1"
+    case "$kind" in
+        ss) jq -e '.inbounds[] | select(.type == "shadowsocks")' "$CONFIG_PATH" >/dev/null ;;
+        hy2) jq -e '.inbounds[] | select(.type == "hysteria2")' "$CONFIG_PATH" >/dev/null ;;
+        tuic) jq -e '.inbounds[] | select(.type == "tuic")' "$CONFIG_PATH" >/dev/null ;;
+        vless) jq -e '.inbounds[] | select(.type == "vless" and .tls.reality.enabled == true)' "$CONFIG_PATH" >/dev/null ;;
+        anytls) jq -e '.inbounds[] | select(.type == "anytls" and .tls.reality.enabled == true)' "$CONFIG_PATH" >/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+
+delete_existing_node() {
+    local kind="$1" enable_key="$2"
+    local had_cache=false had_protocols=false
+    node_kind_exists "$kind" || { err "节点不存在或已经删除"; return 1; }
+
+    case "$kind" in
+        ss) jq '.inbounds |= map(select(.type != "shadowsocks"))' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" ;;
+        hy2) jq '.inbounds |= map(select(.type != "hysteria2"))' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" ;;
+        tuic) jq '.inbounds |= map(select(.type != "tuic"))' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" ;;
+        vless) jq '.inbounds |= map(select(.type != "vless" or .tls.reality.enabled != true))' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" ;;
+        anytls) jq '.inbounds |= map(select(.type != "anytls" or .tls.reality.enabled != true))' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" ;;
+        *) return 1 ;;
+    esac
+
+    if ! sing-box check -c "${CONFIG_PATH}.tmp" >/dev/null 2>&1; then
+        rm -f "${CONFIG_PATH}.tmp"
+        err "删除后的配置校验失败，原配置未修改"
+        return 1
+    fi
+
+    [[ -f "$CACHE_FILE" ]] && had_cache=true
+    [[ -f "$PROTOCOL_FILE" ]] && had_protocols=true
+    $had_cache && cp "$CACHE_FILE" "${CACHE_FILE}.node.tmp" || : > "${CACHE_FILE}.node.tmp"
+    $had_protocols && cp "$PROTOCOL_FILE" "${PROTOCOL_FILE}.node.tmp" || : > "${PROTOCOL_FILE}.node.tmp"
+    set_config_kv "${CACHE_FILE}.node.tmp" "$enable_key" "false"
+    set_config_kv "${PROTOCOL_FILE}.node.tmp" "$enable_key" "false"
+
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    $had_cache && cp "$CACHE_FILE" "${CACHE_FILE}.bak"
+    $had_protocols && cp "$PROTOCOL_FILE" "${PROTOCOL_FILE}.bak"
+    mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    mv "${CACHE_FILE}.node.tmp" "$CACHE_FILE"
+    mv "${PROTOCOL_FILE}.node.tmp" "$PROTOCOL_FILE"
+
+    if ! service_restart; then
+        cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+        $had_cache && cp "${CACHE_FILE}.bak" "$CACHE_FILE" || rm -f "$CACHE_FILE"
+        $had_protocols && cp "${PROTOCOL_FILE}.bak" "$PROTOCOL_FILE" || rm -f "$PROTOCOL_FILE"
+        service_restart || true
+        err "服务启动失败，已恢复删除前配置"
+        return 1
+    fi
+    generate_uris || warn "节点已删除，但链接重新生成失败"
+}
+
+action_delete_node() {
+    read_config || return 1
+    local option=1 choice kind name enable_key
+    local -a kinds=() names=() keys=()
+    node_kind_exists ss && { kinds+=(ss); names+=("Shadowsocks (SS)"); keys+=(ENABLE_SS); }
+    node_kind_exists hy2 && { kinds+=(hy2); names+=("Hysteria2 (HY2)"); keys+=(ENABLE_HY2); }
+    node_kind_exists tuic && { kinds+=(tuic); names+=(TUIC); keys+=(ENABLE_TUIC); }
+    node_kind_exists vless && { kinds+=(vless); names+=("VLESS Reality"); keys+=(ENABLE_REALITY); }
+    node_kind_exists anytls && { kinds+=(anytls); names+=("AnyTLS Reality"); keys+=(ENABLE_ANYTLS); }
+    ((${#kinds[@]})) || { warn "没有可删除的节点"; return 0; }
+
+    echo ""
+    echo "=== 删除节点 ==="
+    for ((i=0; i<${#kinds[@]}; i++)); do
+        echo "$option) ${names[$i]}"
+        option=$((option + 1))
+    done
+    echo "0) 返回"
+    read -r -p "请选择要删除的节点: " choice
+    [[ "$choice" == "0" ]] && return 0
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice >= option )); then
+        warn "无效选项"
+        return 1
+    fi
+    i=$((choice - 1)); kind="${kinds[$i]}"; name="${names[$i]}"; enable_key="${keys[$i]}"
+    read -r -p "确认删除整个 $name 节点及其全部用户？(y/N): " confirm_delete
+    [[ "$confirm_delete" =~ ^[Yy]$ ]] || return 0
+    delete_existing_node "$kind" "$enable_key" && info "已删除 $name 节点"
+}
+
 # 重置SS端口
 action_reset_ss() {
     read_config || return 1
@@ -2769,6 +2856,10 @@ MENU
     echo "$option) 新建节点"
     MENU_MAP[$option]="add_node"
     option=$((option + 1))
+
+    echo "$option) 删除节点"
+    MENU_MAP[$option]="delete_node"
+    option=$((option + 1))
     
     if [ "${ENABLE_SS:-false}" = "true" ]; then
         echo "$option) 重置 SS 端口"
@@ -2868,6 +2959,7 @@ while true; do
             action="${MENU_MAP[$opt]:-}"
             case "$action" in
                 add_node) action_add_node ;;
+                delete_node) action_delete_node ;;
                 reset_ss) action_reset_ss ;;
                 reset_hy2) action_reset_hy2 ;;
                 reset_tuic) action_reset_tuic ;;
